@@ -1,0 +1,379 @@
+\documentclass[11pt,a4paper]{article}
+
+% Packages
+\usepackage[margin=2.5cm]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{hyperref}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{titlesec}
+\usepackage{fancyhdr}
+\usepackage{amsmath}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue!60!black,
+    urlcolor=blue!60!black,
+    citecolor=blue!60!black
+}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{Packet Router Practice}
+\fancyhead[R]{Design Document (living)}
+\fancyfoot[C]{\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+
+\title{%
+    \vspace{-1cm}
+    \textbf{Mini Packet Router / Telemetry Mux}\\[0.35em]
+    \Large Side Project for Bit Manipulation \& Concurrency Practice\\[0.4em]
+    \large Design Document --- Living Draft
+}
+\author{Pablo Buceta Santos}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This document describes a small, self-contained C side project whose purpose is deliberate practice of two interview-relevant skills: bit-level packing/unpacking/validation and concurrent programming with shared state in C.
+It is intentionally independent of the MiniFlight simulation.
+The document is living: it records the current design intent, the rationale behind decisions, and a short catalogue of related concepts that are important for flight-software interviews but are deliberately kept out of the implementation scope of this project.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%----------------------------------------------------------------------
+\section{Document status and scope}
+\label{sec:scope}
+%----------------------------------------------------------------------
+
+\subsection{What this project is}
+
+A focused practice vehicle for:
+\begin{itemize}[leftmargin=*]
+    \item Bit manipulation on fixed-size packets (encode, decode, validate).
+    \item Classic concurrency patterns in C (producer--consumer, ring buffer, mutexes, condition variables, limited atomics, ownership transfer).
+\end{itemize}
+
+It is a learning and interview-preparation artefact, not flight software and not part of MiniFlight.
+
+\subsection{What this project is not}
+
+\begin{itemize}[leftmargin=*]
+    \item Not a real-time operating system or a cyclic executive.
+    \item Not hard real-time; it runs on ordinary Linux with pthreads.
+    \item Not a network stack, device driver, or hardware interface.
+    \item Not an attempt to replace or extend the MiniFlight scheduler.
+    \item Not a complete concurrency curriculum (see Section~\ref{sec:out-of-scope} for deliberately omitted topics).
+\end{itemize}
+
+\subsection{Relationship to MiniFlight}
+
+MiniFlight remains single-threaded by design for the foreseeable future.
+This side project exists precisely so that concurrency and bit-level practice can be pursued without forcing a premature redesign of the main simulation.
+
+\subsection{Maturity}
+
+As of this draft the project exists only as a design.
+Implementation will proceed in the order given in Section~\ref{sec:impl-order}.
+When code appears, this document should be updated to match reality (present-tense architecture only for what is actually built).
+
+%----------------------------------------------------------------------
+\section{Goals and non-goals}
+\label{sec:goals}
+%----------------------------------------------------------------------
+
+\subsection{Primary goals}
+
+\begin{enumerate}[leftmargin=*]
+    \item Become fluent with common bit-manipulation patterns used on status words, flags, and tightly packed telemetry/command fields.
+    \item Understand and be able to explain the core concurrency problems that appear when multiple threads share a queue and a statistics structure: data races, critical sections, ownership, full/empty conditions, and safe shutdown.
+    \item Produce a small, readable program that can be run under load so that races and validation failures are observable.
+    \item Keep the code size modest (target: a few hundred lines) so that the design remains fully understandable.
+\end{enumerate}
+
+\subsection{Secondary goals}
+
+\begin{itemize}[leftmargin=*]
+    \item Practice writing clear rationale for design choices (recorded in this document).
+    \item Maintain a short reference list of interview-relevant concepts that are \emph{not} implemented here, so that study time can be allocated deliberately.
+\end{itemize}
+
+\subsection{Explicit non-goals}
+
+\begin{itemize}[leftmargin=*]
+    \item Implementing a real-time scheduler, rate-monotonic priority assignment, Liu \& Layland test, or response-time analysis inside this program.
+    \item Hard real-time behaviour or deadline monitoring.
+    \item Lock-free queues as the default path (an optional atomic counter is acceptable; a full lock-free ring is not required).
+    \item Dynamic memory allocation on the steady-state path.
+    \item Integration with MiniFlight components or message IDs.
+\end{itemize}
+
+%----------------------------------------------------------------------
+\section{High-level architecture}
+\label{sec:architecture}
+%----------------------------------------------------------------------
+
+The program is a concurrent packet pipeline:
+
+\begin{center}
+\begin{tabular}{@{}p{0.28\textwidth}p{0.28\textwidth}p{0.28\textwidth}@{}}
+\toprule
+\textbf{Producers} & \textbf{Shared ring buffer} & \textbf{Consumers} \\
+\midrule
+Build fixed-size packets with packed bit-fields; push into ring. &
+Fixed capacity circular buffer of packet slots; head/tail protected. &
+Pop packets, decode bits, validate, update shared status, release slot. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+An optional low-frequency monitor thread periodically samples the shared status word and prints a human-readable summary. This makes correctness (or the lack of it) visible under load.
+
+\subsection{Why a ring buffer of fixed slots}
+
+\begin{itemize}[leftmargin=*]
+    \item Matches the ``fixed pools, no heap on the hot path'' bias common in flight software.
+    \item Forces explicit ownership transfer of each slot.
+    \item Makes full/empty conditions obvious and therefore good practice for condition variables or equivalent.
+    \item Keeps memory layout simple for bit-level work on the packet contents.
+\end{itemize}
+
+\subsection{Thread counts (starting point)}
+
+\begin{itemize}[leftmargin=*]
+    \item 2 producers, 1 consumer (baseline).
+    \item Later: 3+ producers, 2 consumers to increase contention.
+    \item Optional monitor thread.
+\end{itemize}
+
+Exact numbers should be configurable at compile time or via command line so that races can be provoked and then eliminated.
+
+%----------------------------------------------------------------------
+\section{Packet layout and bit manipulation}
+\label{sec:packet}
+%----------------------------------------------------------------------
+
+\subsection{Packet size}
+
+Fixed at 16 or 32 bytes (decision to be frozen before implementation).  
+Treated as an array of \texttt{uint8\_t}; multi-byte fields may be accessed via carefully aligned \texttt{uint32\_t}/\texttt{uint64\_t} views or by explicit byte shifts. Compiler bit-fields are avoided for the core practice so that shifts and masks remain visible.
+
+\subsection{Logical fields (illustrative; exact bit positions still open)}
+
+\begin{itemize}[leftmargin=*]
+    \item Magic / version (must match a constant).
+    \item Source / producer ID (small integer, range-checked).
+    \item Sequence number (16- or 32-bit, wraps).
+    \item Flags (individual bits or small bit-fields: priority, error, end-of-group, \ldots).
+    \item One or two payload values of varying bit width.
+    \item Reserved bits (must be zero on a valid packet).
+    \item Parity or simple checksum over selected fields (1--8 bits).
+\end{itemize}
+
+\subsection{Required bit operations}
+
+Producers and consumers must exercise:
+\begin{itemize}[leftmargin=*]
+    \item Set, clear, test single bits and contiguous bit ranges.
+    \item Extract and insert multi-bit fields at arbitrary offsets.
+    \item Pack several small values into one word.
+    \item Compute and check a trivial parity or checksum.
+\end{itemize}
+
+\subsection{Validation rules (consumer side)}
+
+A packet is rejected if any of the following fail:
+\begin{itemize}[leftmargin=*]
+    \item Magic / version mismatch.
+    \item Reserved bits not zero.
+    \item Source ID outside allowed range.
+    \item Parity / checksum mismatch.
+    \item Cross-field consistency rule (example: a given flag set implies a payload field non-zero).
+\end{itemize}
+
+Optional later extension: sequence-number monotonicity or gap detection against a shared last-seen value.
+
+On validation failure the consumer still releases the slot (no leak) and updates error counters / sticky flags in the shared status word.
+
+%----------------------------------------------------------------------
+\section{Concurrency model}
+\label{sec:concurrency}
+%----------------------------------------------------------------------
+
+\subsection{Baseline (always present)}
+
+\begin{itemize}[leftmargin=*]
+    \item One mutex protecting ring-buffer indices (or count).
+    \item Condition variables (or equivalent) for ``not full'' and ``not empty''.
+    \item Clear ownership rule: a slot is owned by at most one thread at a time; ownership moves only under the mutex.
+    \item Shared statistics / status word updated by consumers (and possibly read by the monitor) under appropriate protection.
+\end{itemize}
+
+\subsection{Optional modules (add one at a time)}
+
+These are deliberately separable so that the baseline stays understandable.
+
+\begin{enumerate}[leftmargin=*]
+    \item \textbf{Second shared structure + second mutex.}  
+          Forces explicit lock-ordering discipline and makes deadlock a concrete risk that must be designed out.
+
+    \item \textbf{Reader--writer access to the status word.}  
+          Consumers write; monitor (and possibly producers) read.  
+          Realised with \texttt{pthread\_rwlock} or a simple sequence-counter / version technique.
+
+    \item \textbf{Atomic fast path for a hot counter or flag.}  
+          C11 \texttt{\_Atomic} (or \texttt{stdatomic.h}) so that the contrast between ``mutex everywhere'' and ``atomic for the simple counter'' can be discussed, including a high-level view of memory ordering.
+
+    \item \textbf{Clean shutdown / drain.}  
+          Global running flag, producers stop submitting, consumers drain the queue, all threads join.  
+          Surfaces lifetime and ``who owns the last reference'' questions.
+\end{enumerate}
+
+\subsection{Design rationale for the baseline choices}
+
+\begin{itemize}[leftmargin=*]
+    \item Mutex + condition variables are the most common primitives interviewers expect a candidate to be able to use and explain.
+    \item Starting with a single lock keeps the first correct version simple; additional locks are introduced only after the single-lock version is solid.
+    \item Fixed-capacity ring avoids dynamic allocation and makes the full/empty conditions obvious.
+    \item Copying the packet into the slot (or filling the slot in place under ownership) keeps lifetime reasoning straightforward.
+\end{itemize}
+
+%----------------------------------------------------------------------
+\section{Shared status and observability}
+\label{sec:status}
+%----------------------------------------------------------------------
+
+A small shared structure (or a packed word plus a few counters) holds:
+\begin{itemize}[leftmargin=*]
+    \item Total packets processed (good + bad).
+    \item Validation failure counts (optionally broken out by reason).
+    \item Sticky error flags (bit-packed).
+    \item Optionally last sequence number or a generation counter.
+\end{itemize}
+
+The monitor thread (or a consumer every $N$ packets) prints a readable summary.  
+At process exit a simple consistency check is performed (produced $\approx$ consumed + in-queue, counters non-negative, etc.).
+
+%----------------------------------------------------------------------
+\section{Implementation order}
+\label{sec:impl-order}
+%----------------------------------------------------------------------
+
+\begin{enumerate}[leftmargin=*]
+    \item Packet layout frozen; pure encode / decode / validate functions written and unit-tested single-threaded.
+    \item Ring buffer + single producer / single consumer with mutex and condition variables.
+    \item Multiple producers and consumers.
+    \item Shared status word and validation counters wired in.
+    \item One optional concurrency module at a time.
+    \item Stress runs and deliberate injection of malformed packets.
+\end{enumerate}
+
+Each step should leave the program in a runnable, observable state.
+
+%----------------------------------------------------------------------
+\section{Interview-relevant concepts deliberately kept out of scope}
+\label{sec:out-of-scope}
+%----------------------------------------------------------------------
+
+The following topics are important for flight-software interviews and for real avionics work, yet they are intentionally \emph{not} implemented in this project.  
+They should be studied in parallel (theory, paper exercises, or a separate tiny tool) so that conceptual fluency is not confused with the presence of code in this repository.
+
+\subsection{Real-time task scheduling}
+
+\begin{itemize}[leftmargin=*]
+    \item Periodic tasks with period $T$, deadline $D$ (usually $D \le T$), and worst-case execution time $C$.
+    \item Rate-monotonic priority assignment (higher rate $\rightarrow$ higher priority).
+    \item Liu \& Layland utilization bound as a sufficient (but not necessary) schedulability test.
+    \item Response-time analysis (RTA) as the more precise fixed-point test.
+    \item Practical consequences of a task set that fails the tests (missed deadlines, need to reduce rates or WCET, priority inversion, etc.).
+\end{itemize}
+
+\textit{Why out of scope here:} implementing a scheduler, measuring WCET, enforcing deadlines, and handling preemption under a real RTOS is a separate project of non-trivial size. Linux pthreads with \texttt{SCHED\_FIFO} give only a soft approximation. Conceptual mastery plus a few worked examples is higher leverage for interviews than coding the formulas inside this packet pipeline.
+
+\subsection{Priority inversion and priority inheritance / ceiling}
+
+Classic problem when a low-priority task holds a mutex needed by a high-priority task.  
+Solutions (priority inheritance, priority ceiling) are standard RTOS features.  
+This project may later illustrate the \emph{problem} with two locks, but will not implement a priority-inheritance protocol.
+
+\subsection{Hard real-time operating systems}
+
+FreeRTOS, Zephyr, RTEMS, VxWorks, etc.  
+Practice environments: real boards, QEMU, or vendor simulators.  
+Stock Linux is not a hard RTOS; PREEMPT\_RT improves latency but does not change the fundamental model.
+
+\subsection{Other concurrency topics of secondary priority for this project}
+
+\begin{itemize}[leftmargin=*]
+    \item Full lock-free ring buffers and ABA problems.
+    \item Memory-ordering deep dives beyond the level needed to use \texttt{\_Atomic} correctly for simple counters.
+    \item False sharing / cache-line padding (worth knowing about; not required to implement here).
+    \item Signal safety and async cancellation.
+\end{itemize}
+
+%----------------------------------------------------------------------
+\section{Design decision log (initial)}
+\label{sec:decisions}
+%----------------------------------------------------------------------
+
+\begin{center}
+\begin{tabular}{@{}p{0.32\textwidth}p{0.58\textwidth}@{}}
+\toprule
+\textbf{Decision} & \textbf{Rationale} \\
+\midrule
+Separate project from MiniFlight & Avoids contaminating the single-threaded design; keeps each artefact focused. \\
+Fixed-size packets + ring of slots & Matches flight-software preference for static allocation; forces clear ownership. \\
+Shifts/masks over compiler bit-fields & Makes the bit operations explicit and portable for practice. \\
+Mutex + condvar as baseline & Highest-frequency interview primitives; easiest correct starting point. \\
+Optional modules behind switches & Keeps baseline readable; allows incremental exposure to extra patterns. \\
+Validation as first-class consumer work & Ties bit manipulation to a realistic robustness concern. \\
+RT scheduler / RTA out of scope & Formulas are simple; surrounding scaffolding (WCET, release, observation, true RTOS) is not. Conceptual study is higher ROI for interviews. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+%----------------------------------------------------------------------
+\section{How to maintain this document}
+\label{sec:doc-maintenance}
+%----------------------------------------------------------------------
+
+Update this file when any of the following change:
+
+\begin{center}
+\begin{tabular}{@{}p{0.42\textwidth}p{0.48\textwidth}@{}}
+\toprule
+\textbf{Change} & \textbf{Section(s)} \\
+\midrule
+Packet field layout or validation rules frozen or altered & \ref{sec:packet} \\
+Ring capacity, ownership rules, or baseline synchronisation & \ref{sec:architecture}, \ref{sec:concurrency} \\
+Optional module added or behaviour clarified & \ref{sec:concurrency} \\
+Shared status contents or observability & \ref{sec:status} \\
+Implementation status advances & \ref{sec:scope}, \ref{sec:impl-order} \\
+New out-of-scope topic judged important for interviews & \ref{sec:out-of-scope} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Prefer short factual edits.  
+Planned but unimplemented features stay in non-goals or explicitly labelled ``planned'' paragraphs; they must not appear in present-tense architecture descriptions.
+
+%----------------------------------------------------------------------
+\section{Revision note}
+\label{sec:revision}
+%----------------------------------------------------------------------
+
+Initial draft created before any implementation code.
+Records the agreed scope (bit manipulation + producer/consumer concurrency), the packet and ring-buffer shape, the optional concurrency modules, and the deliberate exclusion of a real-time scheduler / schedulability analysis from this particular project.
+Future revisions should track the code as it is written.
+
+\end{document}
