@@ -3,6 +3,7 @@
 #include "../../include/entities/producer.h"
 #include "../../include/common/packet.h"
 #include "../../include/common/ring_buffer.h"
+#include "../../include/common/stats.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -33,10 +34,23 @@ void prod_tick(producer *prod)
 
     /** Write to buffer */
     uint8_t result = ring_buffer_write(buffer);
-    if (result == 0){
-        printf("Producer: Failed to write to ring buffer\n");
+    switch(result){
+        case RING_ERR_BUSY:{
+            stats_incr_failed_write_busy();
+            break;
+        }
+        case RING_ERR_FULL:{
+            stats_incr_failed_write_full();
+            break;
+        }
+        case RING_SUCCESS:{
+            stats_incr_total_written();
+            break;
+        }
+        default:{
+            break;
+        }
     }
-
 }
 
 

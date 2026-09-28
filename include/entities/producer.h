@@ -13,7 +13,10 @@ typedef struct producer{
     uint8_t producer_id;
 }producer;  
 
-
+typedef struct producer_args{
+    producer *prod;
+    uint32_t freq_hz;
+}producer_args;
 
 void prod_tick(producer *prod);
 void prod_make_packet(packet *out_pkt, producer *prod, uint8_t flags, uint8_t *prim, uint8_t *sec);

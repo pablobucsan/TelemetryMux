@@ -3,6 +3,7 @@
 #include "../../include/entities/consumer.h"
 #include "../../include/common/packet.h"
 #include "../../include/common/ring_buffer.h"
+#include "../../include/common/stats.h"
 #include <stdio.h>
 
 
@@ -14,9 +15,22 @@ void consumer_tick(consumer *consumer)
     uint8_t buffer[PACKET_SIZE];
     uint8_t result = ring_buffer_read(buffer);
     
-    if (result == 0){
-        printf("Consumer: Nothing to read from ring buffer\n");
-        return;
+    switch(result){
+        case RING_ERR_BUSY:{
+            stats_incr_failed_read_busy();
+            return;
+        }
+        case RING_ERR_EMPTY:{
+            stats_incr_failed_read_empty();
+            return;
+        }
+        case RING_SUCCESS:{
+            stats_incr_total_read();
+            break;
+        }
+        default:{
+            return;
+        }
     }
     
     /** Deserialize */
@@ -27,6 +41,4 @@ void consumer_tick(consumer *consumer)
         return;
     }
 
-    /** For now, print it */
-    test_print_pkt(&pkt);
 }

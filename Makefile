@@ -1,7 +1,9 @@
+
+SANITIZERS = -fsanitize=thread
 CC = gcc
-CFLAGS = -std=c11 -Wall -Wextra -Wpedantic -g -O0 -pthread
+CFLAGS = -std=c11 -Wall -Wextra -Wpedantic -g -O0 -pthread $(SANITIZERS)
 CPPFLAGS = -Iinclude
-LDFLAGS = 
+LDFLAGS = $(SANITIZERS)
 LDLIBS = 
 
 
